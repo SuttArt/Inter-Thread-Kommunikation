@@ -51,7 +51,12 @@ impl<T: Send> Producer<T> {
 			match result {
 				Ok(_) => return Ok(()), // Successful push, return
 				Err(SendError(returned_val)) => {
-					val = returned_val; // Extract item from error and retry
+					// Check if the consumer is still available
+					if self.access_flags.done.load(Ordering::SeqCst) {
+						return Err(SendError(returned_val)); // Stop if the consumer is dropped
+					}
+					// Otherwise, extract the item and retry
+					val = returned_val;
 				}
 			}
 
@@ -105,6 +110,13 @@ impl<T: Send> Consumer<T> {
 			// If the buffer is empty, yield briefly before retrying
 			std::thread::yield_now();
 		}
+	}
+}
+
+impl<T: Send> Drop for Consumer<T> {
+	fn drop(&mut self) {
+		// Signal that no more items will be sent
+		self.access_flags.done.store(true, Ordering::SeqCst);
 	}
 }
 
