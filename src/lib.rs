@@ -312,12 +312,18 @@ impl AccessFlags {
 
 	fn lock(&self, id: usize) {
 		let other = 1 - id;
+		// Producer/Consumer ist bereit to produce/consume
 		self.flag[id].store(true, Ordering::SeqCst);
+		// Erlauben producer/consumer zu produce/consume
 		self.turn.store(other, Ordering::SeqCst);
-		while self.flag[other].load(Ordering::SeqCst) && self.turn.load(Ordering::SeqCst) == other {}
+		while self.flag[other].load(Ordering::SeqCst) && self.turn.load(Ordering::SeqCst) == other {
+			// Warten für producer/consumer to finish
+			// Producer/Consumer wartet,ob consumer/producer ist fertig, und jetzt ist consumer/producer an der Reihe
+		}
 	}
 
 	fn unlock(&self, id: usize) {
+		// Producer/Consumer ist nicht mehr im kritischen Bereich
 		self.flag[id].store(false, Ordering::SeqCst);
 	}
 }
