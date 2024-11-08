@@ -55,14 +55,7 @@ impl<T: Send> Producer<T> {
 		let mut backoff = 1;
 		loop {
 			// Peterson’s Algorithm
-			self.access_flags.prod_flag.store(true, Ordering::SeqCst);
-			self.access_flags.turn.store(1, Ordering::SeqCst);
-
-			while self.access_flags.turn.load(Ordering::SeqCst) == 1 {
-				if !self.access_flags.cons_flag.load(Ordering::SeqCst) {
-					break;
-				}
-			}
+			self.access_flags.lock(0);
 
 			// Critical section
 			let result = unsafe {
@@ -78,7 +71,7 @@ impl<T: Send> Producer<T> {
 			};
 
 			// Exit section
-			self.access_flags.prod_flag.store(false, Ordering::SeqCst);
+			self.access_flags.unlock(0);
 
 			// Check, ob der Push erfolgreich war
 			match result {
@@ -133,14 +126,7 @@ impl<T: Send> Consumer<T> {
 	pub fn recv(&self) -> Result<T, RecvError> {
 		loop {
 			// Peterson’s Algorithm
-			self.access_flags.cons_flag.store(true, Ordering::SeqCst);
-			self.access_flags.turn.store(0, Ordering::SeqCst);
-
-			while self.access_flags.turn.load(Ordering::SeqCst) == 0 {
-				if !self.access_flags.prod_flag.load(Ordering::SeqCst) {
-					break;
-				}
-			}
+			self.access_flags.lock(1);
 
 			// Critical section
 			let result = unsafe {
@@ -156,7 +142,7 @@ impl<T: Send> Consumer<T> {
 			};
 
 			// Exit section
-			self.access_flags.cons_flag.store(false, Ordering::SeqCst);
+			self.access_flags.unlock(1);
 
 			// Return, wenn ein Item existiert
 			if let Some(item) = result {
@@ -196,14 +182,7 @@ impl<T: Send> Iterator for Consumer<T> {
 	fn next(&mut self) -> Option<Self::Item> {
 		loop {
 			// Peterson’s Algorithm
-			self.access_flags.cons_flag.store(true, Ordering::SeqCst);
-			self.access_flags.turn.store(0, Ordering::SeqCst);
-
-			while self.access_flags.turn.load(Ordering::SeqCst) == 0 {
-				if !self.access_flags.prod_flag.load(Ordering::SeqCst) {
-					break;
-				}
-			}
+			self.access_flags.lock(1);
 
 			// Critical section
 			let result = unsafe {
@@ -219,7 +198,7 @@ impl<T: Send> Iterator for Consumer<T> {
 			};
 
 			// Exit section
-			self.access_flags.cons_flag.store(false, Ordering::SeqCst);
+			self.access_flags.unlock(1);
 
 			// Return, wenn ein Item existiert
 			if result.is_some() {
@@ -335,16 +314,34 @@ impl<T> Buffer<T> {
 #[derive(Debug)]
 pub struct AccessFlags {
 	// Siehe Peterson’s Algorithmus in der Vorlesung
-	// Flag für den Producer
-	prod_flag: AtomicBool,
-	// Flag für den Consumer
-	cons_flag: AtomicBool,
-	// Spinlock, 1 für Producer, 0 für Consumer
+	// 0 für den Producer
+	// 1 für den Consumer
+	flag: [AtomicBool; 2],
 	turn: AtomicUsize,
 	// Flag für Übertragungszustand:
 	// false - die Daten werden noch übertragen
 	// true - Objekte können Destruktoren aufrufen
 	done: AtomicBool,
+}
+impl AccessFlags {
+	fn new() -> Self {
+		AccessFlags {
+			flag: [AtomicBool::new(false), AtomicBool::new(false)],
+			turn: AtomicUsize::new(0),
+			done: AtomicBool::new(false),
+		}
+	}
+
+	fn lock(&self, id: usize) {
+		let other = 1 - id;
+		self.flag[id].store(true, Ordering::SeqCst);
+		self.turn.store(other, Ordering::SeqCst);
+		while self.flag[other].load(Ordering::SeqCst) && self.turn.load(Ordering::SeqCst) == other {}
+	}
+
+	fn unlock(&self, id: usize) {
+		self.flag[id].store(false, Ordering::SeqCst);
+	}
 }
 
 /// Channel, Funktion, die den Buffer, Producer und Consumer erstellt
@@ -356,15 +353,8 @@ pub fn channel<T: Send>() -> (Producer<T>, Consumer<T>) {
 	// Buffer in Arc umwickeln, damit er von beiden Objekten genutzt werden kann
 	let shared_buffer = Arc::new(buffer);
 
-	// Flags für den Peterson-Algorithmus initialisieren
-	let access_flags = AccessFlags {
-		prod_flag: AtomicBool::new(false),
-		cons_flag: AtomicBool::new(false),
-		turn: AtomicUsize::new(0),
-		done: AtomicBool::new(false),
-	};
 	// Flags in Arc umwickeln, damit sie von beiden Objekten genutzt werden können
-	let shared_access_flags = Arc::new(access_flags);
+	let shared_access_flags = Arc::new(AccessFlags::new());
 
 	// Initialisieren und Rückgabe von Producer und Consumer
 	(Producer {
