@@ -1,5 +1,6 @@
 #![allow(unused_variables)]
 
+use std::cell::UnsafeCell;
 // Wird für Daten mit speziellen Laufzeiten in unsafe Code verwendet
 use std::marker::PhantomData;
 // Thread-sicherer Referenz-Zähl-Zeiger. "Hält" die Daten und ermöglicht Data-Sharing zwischen Threads
@@ -58,17 +59,7 @@ impl<T: Send> Producer<T> {
 			self.access_flags.lock(0);
 
 			// Critical section
-			let result = unsafe {
-				// Konvertiere die Arc-Zeigerstruktur in einen rohen Zeiger.
-				// `Arc::as_ptr` gibt einen konstanten Zeiger zurück, den wir hier in einen mutablen
-				// Zeiger umwandeln (da `push` den Buffer verändert).
-				let buffer_ptr = Arc::as_ptr(&self.buffer) as *mut Buffer<T>;
-				// Dereferenziere den Zeiger und rufe `push` auf, um das Item in den Buffer zu schreiben.
-				// Durch das Dereferenzieren greifen wir direkt auf den Speicherbereich zu, auf den
-				// `buffer_ptr` zeigt. Dies ist der unsichere Teil, da wir direkt auf Speicher zugreifen,
-				// ohne die Sicherheitsüberprüfungen von Rust.
-				(*buffer_ptr).push(val)
-			};
+			let result = self.buffer.push(val);
 
 			// Exit section
 			self.access_flags.unlock(0);
@@ -129,17 +120,7 @@ impl<T: Send> Consumer<T> {
 			self.access_flags.lock(1);
 
 			// Critical section
-			let result = unsafe {
-				// Konvertiere den Arc-Zeiger in einen rohen Zeiger.
-				// `Arc::as_ptr` gibt uns einen konstanten Zeiger, den wir hier in einen mutablen
-				// Zeiger umwandeln, um die `pop`-Operation auszuführen, die den Buffer ändert.
-				let buffer_ptr = Arc::as_ptr(&self.buffer) as *mut Buffer<T>;
-				// Dereferenziere den Zeiger und rufe `pop` auf, um das nächste Element aus dem Buffer zu lesen.
-				// Durch das Dereferenzieren greifen wir direkt auf den Speicherbereich zu, auf den
-				// `buffer_ptr` zeigt. Dies ist der unsichere Teil, da Rusts Sicherheitsüberprüfungen
-				// hier nicht aktiv sind.
-				(*buffer_ptr).pop()
-			};
+			let result = self.buffer.pop();
 
 			// Exit section
 			self.access_flags.unlock(1);
@@ -180,41 +161,7 @@ impl<T: Send> Drop for Consumer<T> {
 impl<T: Send> Iterator for Consumer<T> {
 	type Item = T;
 	fn next(&mut self) -> Option<Self::Item> {
-		loop {
-			// Peterson’s Algorithm
-			self.access_flags.lock(1);
-
-			// Critical section
-			let result = unsafe {
-				// Konvertiere den Arc-Zeiger in einen rohen Zeiger.
-				// `Arc::as_ptr` gibt uns einen konstanten Zeiger, den wir hier in einen mutablen
-				// Zeiger umwandeln, um die `pop`-Operation auszuführen, die den Buffer ändert.
-				let buffer_ptr = Arc::as_ptr(&self.buffer) as *mut Buffer<T>;
-				// Dereferenziere den Zeiger und rufe `pop` auf, um das nächste Element aus dem Buffer zu lesen.
-				// Durch das Dereferenzieren greifen wir direkt auf den Speicherbereich zu, auf den
-				// `buffer_ptr` zeigt. Dies ist der unsichere Teil, da Rusts Sicherheitsüberprüfungen
-				// hier nicht aktiv sind.
-				(*buffer_ptr).pop()
-			};
-
-			// Exit section
-			self.access_flags.unlock(1);
-
-			// Return, wenn ein Item existiert
-			if result.is_some() {
-				return result;
-			}
-
-			// Wenn der Buffer leer ist, prüfen, ob der Producer fertig ist
-			if self.access_flags.done.load(Ordering::SeqCst) {
-				// Keine weiteren Items werden produziert, beenden
-				// Kein Fehler, da wir Option<Self::Item> zurückgeben
-				return None;
-			}
-
-			// Wenn der Buffer leer ist, kurz warten, bevor erneut versucht wird
-			std::thread::yield_now();
-		}
+		todo!("a")
 	}
 }
 
@@ -228,11 +175,11 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 #[derive(Debug)]
 pub struct Buffer<T> {
 	// Daten im Buffer
-	data: Vec<Option<T>>,
+	data: UnsafeCell<Vec<Option<T>>>,
 	// Index für den Producer, der angibt, wo das letzte Item hinzugefügt wurde
-	write_index: usize,
+	write_index: UnsafeCell<usize>,
 	// Index für den Consumer, der angibt, wo das letzte Item gelesen wurde
-	read_index: usize,
+	read_index: UnsafeCell<usize>,
 	// Gemeinsame Kapazität des Buffers
 	capacity: usize,
 }
@@ -248,9 +195,9 @@ impl<T> Buffer<T> {
 		let buffer = iter::repeat_with(|| None).take(capacity).collect();
 
 		Buffer {
-			data: buffer,
-			write_index: 0,
-			read_index: 0,
+			data: UnsafeCell::new(buffer),
+			write_index: UnsafeCell::new(0),
+			read_index: UnsafeCell::new(0),
 			capacity,
 		}
 	}
@@ -265,22 +212,27 @@ impl<T> Buffer<T> {
 	///	}
 	///}
 	/// ```
-	fn push(&mut self, item: T) -> Result<(), SendError<T>> {
-		// Wenn am write_index schon ein Item existiert -> Buffer voll -> Fehler
-		if self.data[self.write_index].is_some() {
-			Err(SendError(item))
-		} else {
-			// Schreiben in Buffer
-			self.data[self.write_index] = Some(item);
-			// Ring-Buffer Implementierung
-			if self.write_index != self.capacity - 1 {
-				self.write_index += 1;
-				if self.write_index >= self.capacity {
-					self.write_index = 0;
+	fn push(&self, item: T) -> Result<(), SendError<T>> {
+		unsafe {
+			let data = &mut *self.data.get();
+			let write_index = &mut *self.write_index.get();
+
+			// Wenn am write_index schon ein Item existiert -> Buffer voll -> Fehler
+			if data[*write_index].is_some() {
+				Err(SendError(item))
+			} else {
+				// Schreiben in Buffer
+				data[*write_index] = Some(item);
+				// Ring-Buffer Implementierung
+				if *write_index != self.capacity - 1 {
+					*write_index += 1;
+					if *write_index >= self.capacity {
+						*write_index = 0;
+					}
 				}
+				// Ok(()) - Return für Result in Rust
+				Ok(())
 			}
-			// Ok(()) - Return für Result in Rust
-			Ok(())
 		}
 	}
 
@@ -291,21 +243,20 @@ impl<T> Buffer<T> {
 	///         println!("Removed: {}", value);
 	///     }
 	/// ```
-	fn pop(&mut self) -> Option<T> {
-		// Wenn wir Item aus dem Buffer lesen/pop können (.take())
-		if let Some(item) = self.data[self.read_index].take() {
-			// Ring-Buffer Implementierung
-			if self.read_index != self.write_index {
-				self.read_index += 1;
-				if self.read_index >= self.capacity {
-					self.read_index = 0;
-				}
+	fn pop(&self) -> Option<T> {
+		unsafe {
+			let data = &mut *self.data.get();
+			let read_index = &mut *self.read_index.get();
+
+			// Wenn wir Item aus dem Buffer lesen/pop können (.take())
+			if let Some(item) = data[*read_index].take() {
+				// Ring-Buffer Implementierung
+				*read_index = (*read_index + 1) % self.capacity;
+
+				Some(item)
+			} else {
+				None
 			}
-			// Return
-			Some(item)
-		} else {
-			// Return None, wenn wir nichts gelesen haben
-			None
 		}
 	}
 }
@@ -349,9 +300,8 @@ pub fn channel<T: Send>() -> (Producer<T>, Consumer<T>) {
 	// Kapazität des Buffers. Kann jede beliebige Zahl sein, da wir einen Ring-Buffer verwenden
 	const CAPACITY: usize = 1000;
 	// Buffer initialisieren
-	let buffer = Buffer::new(CAPACITY);
 	// Buffer in Arc umwickeln, damit er von beiden Objekten genutzt werden kann
-	let shared_buffer = Arc::new(buffer);
+	let shared_buffer = Arc::new(Buffer::new(CAPACITY));
 
 	// Flags in Arc umwickeln, damit sie von beiden Objekten genutzt werden können
 	let shared_access_flags = Arc::new(AccessFlags::new());
