@@ -47,7 +47,7 @@ impl<T: Send> Producer<T> {
 	/// let (px, cx) = channel();
 	/// thread::spawn(move || {
 	/// 	for i in 0..10 {
-	/// 		px.send("Ping").unwrap();
+	/// 		px.send(i).unwrap();
 	/// 	}
 	/// });
 	/// ```
@@ -161,7 +161,28 @@ impl<T: Send> Drop for Consumer<T> {
 impl<T: Send> Iterator for Consumer<T> {
 	type Item = T;
 	fn next(&mut self) -> Option<Self::Item> {
-		todo!("a")
+		loop {
+			// Peterson’s Algorithm
+			self.access_flags.lock(1);
+
+			// Critical section
+			let result = self.buffer.pop();
+			// Exit section
+			self.access_flags.unlock(1);
+
+			// Return, wenn ein Item existiert
+			if result.is_some() {
+				return result;
+			}
+			// Wenn der Buffer leer ist, prüfen, ob der Producer fertig ist
+			if self.access_flags.done.load(Ordering::SeqCst) {
+				// Keine weiteren Items werden produziert, beenden
+				// Kein Fehler, da wir Option<Self::Item> zurückgeben
+				return None;
+			}
+			// Wenn der Buffer leer ist, kurz warten, bevor erneut versucht wird
+			std::thread::yield_now();
+		}
 	}
 }
 
@@ -247,11 +268,17 @@ impl<T> Buffer<T> {
 		unsafe {
 			let data = &mut *self.data.get();
 			let read_index = &mut *self.read_index.get();
+			let write_index = &mut *self.write_index.get();
 
 			// Wenn wir Item aus dem Buffer lesen/pop können (.take())
 			if let Some(item) = data[*read_index].take() {
 				// Ring-Buffer Implementierung
-				*read_index = (*read_index + 1) % self.capacity;
+				if *read_index != *write_index {
+					*read_index += 1;
+					if *read_index >= self.capacity {
+						*read_index = 0;
+					}
+				}
 
 				Some(item)
 			} else {
